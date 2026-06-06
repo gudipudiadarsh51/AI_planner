@@ -1,0 +1,15 @@
+# virtual environments
+sigr_env/
+.venv/
+
+# environment variables
+.env
+
+# python cache
+__pycache__/
+
+# OS files
+.DS_Store
+
+# sensitive keys
+gcp_key.json
