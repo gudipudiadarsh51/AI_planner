@@ -1,4 +1,5 @@
 import os
+import sys
 import numpy as np
 import pandas as pd
 import tensorflow as tf
@@ -16,23 +17,34 @@ BATCH_SIZE       = 512
 ETA              = 0.5
 MAX_GROUP_SIZE   = 10
 
-def load_parquet(blob_prefix):
+sys.stdout.reconfigure(line_buffering=True)
+
+def load_parquet(blob_prefix, columns=None):
     fs = pafs.GcsFileSystem()
     dataset = pq.ParquetDataset(
         f"{BUCKET}/{DATA_PREFIX}/{blob_prefix}",
         filesystem=fs
     )
-    return dataset.read_pandas().to_pandas()
+    table = dataset.read(columns=columns)
+    return table.to_pandas()
 
 print("Loading data...")
-interactions = load_parquet("user_business_interactions")
-social_edges = load_parquet("user_social_edges")
-group_edges  = load_parquet("group_item_edges")
-print(f"Loaded: interactions={len(interactions)} "
-      f"social_edges={len(social_edges)} "
-      f"group_edges={len(group_edges)}")
+interactions = load_parquet("user_business_interactions", columns=[
+    "user_id", "business_id", "review_id", "bgem_edge_weight"
+])
+print(f"  interactions: {len(interactions)}")
 
-# ── ID Encoding ───────────────────────────────────────────────────────────
+social_edges = load_parquet("user_social_edges", columns=[
+    "src_user_id", "dst_user_id"
+])
+print(f"  social_edges: {len(social_edges)}")
+
+group_edges = load_parquet("group_item_edges", columns=[
+    "group_id", "item_id", "edge_weight"
+])
+print(f"  group_edges: {len(group_edges)}")
+print("Data loaded.")
+
 all_users = pd.concat([
     interactions["user_id"],
     social_edges["src_user_id"],
@@ -56,34 +68,34 @@ N_GROUPS = len(group2idx)
 
 print(f"Users: {N_USERS} | Items: {N_ITEMS} | Groups: {N_GROUPS}")
 
-# ── Vectorised group member map ───────────────────────────────────────────
-# No iterrows — use groupby on group_edges directly
-# Each group_id maps to the users who interacted with it via reviews
 print("Building group member map...")
 interactions["user_idx"]  = interactions["user_id"].map(user2idx)
 interactions["item_idx"]  = interactions["business_id"].map(item2idx)
 group_edges["group_idx"]  = group_edges["group_id"].map(group2idx)
 group_edges["item_idx"]   = group_edges["item_id"].map(item2idx)
 
-# Build group→members by joining group_edges items back to interactions
 ge_items = group_edges[["group_idx", "item_idx"]].dropna()
 ge_items["item_idx"] = ge_items["item_idx"].astype(int)
 
-# For each group, find users who reviewed any item in that group
 item_to_users = interactions.groupby("item_idx")["user_idx"].apply(list).to_dict()
 
 group_member_map = defaultdict(list)
-for _, row in ge_items.drop_duplicates("group_idx").iterrows():
-    gidx = int(row["group_idx"])
-    iidx = int(row["item_idx"])
+for gidx, iidx in zip(
+    ge_items.drop_duplicates("group_idx")["group_idx"].astype(int),
+    ge_items.drop_duplicates("group_idx")["item_idx"].astype(int)
+):
     members = item_to_users.get(iidx, [])[:MAX_GROUP_SIZE]
     group_member_map[gidx] = [int(m) for m in members if pd.notna(m)]
 
-print(f"Group member map built: {len(group_member_map)} groups with members")
+print(f"Group member map built: {len(group_member_map)} groups")
 
-# ── Vectorised user→items map for negative sampling ───────────────────────
 uv_member_map = interactions.groupby("user_idx")["item_idx"].apply(list).to_dict()
 print("User-item map built.")
+
+del social_edges
+import gc
+gc.collect()
+print("Freed social_edges memory.")
 
 def get_member_arrays(group_indices):
     batch_members = []
@@ -102,7 +114,6 @@ def get_member_arrays(group_indices):
         tf.constant(batch_masks,   dtype=tf.float32)
     )
 
-# ── BGEM Model ────────────────────────────────────────────────────────────
 class BGEMModel(tf.keras.Model):
     def __init__(self, n_users, n_items, n_groups, emb_dim):
         super().__init__()
@@ -141,7 +152,6 @@ class BGEMModel(tf.keras.Model):
         v = self.item_emb(item_ids)
         return tf.reduce_sum(g * v, axis=-1)
 
-# ── Negative Sampling ─────────────────────────────────────────────────────
 item_popularity = (
     interactions
     .groupby("business_id")["review_id"]
@@ -171,13 +181,12 @@ def sample_negatives_gv(group_indices, k):
                 negs = np.random.choice(item_pop_indices, size=k, p=item_pop_probs)
             else:
                 counts  = np.bincount(items, minlength=N_ITEMS).astype(float)
-                counts   = (counts + 1e-6) ** 0.75
-                counts  /= counts.sum()
-                negs     = np.random.choice(N_ITEMS, size=k, p=counts)
+                counts  = (counts + 1e-6) ** 0.75
+                counts /= counts.sum()
+                negs    = np.random.choice(N_ITEMS, size=k, p=counts)
         batch_negs.append(negs)
     return np.array(batch_negs)
 
-# ── BPR Loss ──────────────────────────────────────────────────────────────
 def bpr_loss(pos_scores, neg_scores, edge_weights):
     pos_loss = tf.math.log_sigmoid(pos_scores)
     neg_loss = tf.reduce_mean(
@@ -185,7 +194,6 @@ def bpr_loss(pos_scores, neg_scores, edge_weights):
     )
     return -tf.reduce_mean(edge_weights * (pos_loss + neg_loss))
 
-# ── Prepare arrays ────────────────────────────────────────────────────────
 uv_users   = interactions["user_idx"].fillna(0).astype(int).values
 uv_items   = interactions["item_idx"].fillna(0).astype(int).values
 uv_weights = interactions["bgem_edge_weight"].values.astype(np.float32)
@@ -196,7 +204,6 @@ gv_weights = group_edges["edge_weight"].values.astype(np.float32)
 
 print(f"G_UV: {len(uv_users)} | G_GV: {len(gv_groups)}")
 
-# ── Model + Optimiser ─────────────────────────────────────────────────────
 model     = BGEMModel(N_USERS, N_ITEMS, N_GROUPS, EMBEDDING_DIM)
 optimizer = tf.keras.optimizers.Adam(LEARNING_RATE)
 
@@ -226,7 +233,6 @@ def train_step_gv(member_ids, member_mask, v_pos_ids, v_neg_ids, weights):
     optimizer.apply_gradients(zip(grads, model.trainable_variables))
     return loss
 
-# ── Joint Training Loop ───────────────────────────────────────────────────
 print("Starting joint training...")
 n_uv = len(uv_users)
 n_gv = len(gv_groups)
