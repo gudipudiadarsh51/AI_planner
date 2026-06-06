@@ -6,6 +6,7 @@ import tensorflow as tf
 import pyarrow.parquet as pq
 import pyarrow.fs as pafs
 from collections import defaultdict
+import gc
 
 BUCKET           = "yelp-sigr-training"
 DATA_PREFIX      = "sigr-training"
@@ -34,28 +35,17 @@ interactions = load_parquet("user_business_interactions", columns=[
 ])
 print(f"  interactions: {len(interactions)}")
 
-social_edges = load_parquet("user_social_edges", columns=[
-    "src_user_id", "dst_user_id"
-])
-print(f"  social_edges: {len(social_edges)}")
-
 group_edges = load_parquet("group_item_edges", columns=[
     "group_id", "item_id", "edge_weight"
 ])
 print(f"  group_edges: {len(group_edges)}")
 print("Data loaded.")
 
-all_users = pd.concat([
-    interactions["user_id"],
-    social_edges["src_user_id"],
-    social_edges["dst_user_id"]
-]).dropna().unique()
-
+all_users = interactions["user_id"].dropna().unique()
 all_items = pd.concat([
     interactions["business_id"],
     group_edges["item_id"]
 ]).dropna().unique()
-
 all_groups = group_edges["group_id"].dropna().unique()
 
 user2idx  = {u: i for i, u in enumerate(all_users)}
@@ -69,20 +59,17 @@ N_GROUPS = len(group2idx)
 print(f"Users: {N_USERS} | Items: {N_ITEMS} | Groups: {N_GROUPS}")
 
 print("Building group member map...")
-interactions["user_idx"]  = interactions["user_id"].map(user2idx)
-interactions["item_idx"]  = interactions["business_id"].map(item2idx)
-group_edges["group_idx"]  = group_edges["group_id"].map(group2idx)
-group_edges["item_idx"]   = group_edges["item_id"].map(item2idx)
-
-ge_items = group_edges[["group_idx", "item_idx"]].dropna()
-ge_items["item_idx"] = ge_items["item_idx"].astype(int)
+interactions["user_idx"] = interactions["user_id"].map(user2idx)
+interactions["item_idx"] = interactions["business_id"].map(item2idx)
+group_edges["group_idx"] = group_edges["group_id"].map(group2idx)
+group_edges["item_idx"]  = group_edges["item_id"].map(item2idx)
 
 item_to_users = interactions.groupby("item_idx")["user_idx"].apply(list).to_dict()
 
 group_member_map = defaultdict(list)
 for gidx, iidx in zip(
-    ge_items.drop_duplicates("group_idx")["group_idx"].astype(int),
-    ge_items.drop_duplicates("group_idx")["item_idx"].astype(int)
+    group_edges.drop_duplicates("group_idx")["group_idx"].dropna().astype(int),
+    group_edges.drop_duplicates("group_idx")["item_idx"].dropna().astype(int)
 ):
     members = item_to_users.get(iidx, [])[:MAX_GROUP_SIZE]
     group_member_map[gidx] = [int(m) for m in members if pd.notna(m)]
@@ -92,10 +79,8 @@ print(f"Group member map built: {len(group_member_map)} groups")
 uv_member_map = interactions.groupby("user_idx")["item_idx"].apply(list).to_dict()
 print("User-item map built.")
 
-del social_edges
-import gc
+del item_to_users
 gc.collect()
-print("Freed social_edges memory.")
 
 def get_member_arrays(group_indices):
     batch_members = []
@@ -202,6 +187,8 @@ gv_groups  = group_edges["group_idx"].fillna(0).astype(int).values
 gv_items   = group_edges["item_idx"].fillna(0).astype(int).values
 gv_weights = group_edges["edge_weight"].values.astype(np.float32)
 
+del interactions, group_edges
+gc.collect()
 print(f"G_UV: {len(uv_users)} | G_GV: {len(gv_groups)}")
 
 model     = BGEMModel(N_USERS, N_ITEMS, N_GROUPS, EMBEDDING_DIM)
@@ -256,7 +243,7 @@ for epoch in range(EPOCHS):
     gv_start = 0
     total_steps = (n_uv + n_gv) // BATCH_SIZE
 
-    for _ in range(total_steps):
+    for step in range(total_steps):
         use_gv = np.random.rand() < (1.0 / (1.0 + ETA))
 
         if use_gv and gv_start < n_gv:
@@ -290,6 +277,9 @@ for epoch in range(EPOCHS):
             epoch_loss_uv += loss.numpy()
             n_uv_batches  += 1
             uv_start       = end
+
+        if step % 1000 == 0:
+            print(f"  step {step}/{total_steps}")
 
     print(f"Epoch {epoch+1}/{EPOCHS} — "
           f"G_UV Loss: {epoch_loss_uv/max(n_uv_batches,1):.4f} | "
