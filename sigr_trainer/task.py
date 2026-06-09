@@ -289,5 +289,35 @@ save_path = os.environ.get(
     "AIP_MODEL_DIR",
     "gs://yelp-sigr-training/models/sigr_v1"
 )
-model.save(save_path)
-print(f"Model saved to {save_path}")
+
+from google.cloud import storage
+import io
+import json
+
+client = storage.Client()
+gcs_bucket = client.bucket("yelp-sigr-training")
+
+def save_numpy_to_gcs(array, blob_name):
+    buf = io.BytesIO()
+    np.save(buf, array)
+    buf.seek(0)
+    blob = gcs_bucket.blob(blob_name)
+    blob.upload_from_file(buf)
+    print(f"  Saved {blob_name} — shape {array.shape}")
+
+print("Saving model artifacts...")
+save_numpy_to_gcs(model.user_emb.embeddings.numpy(), "models/sigr_v1/user_embeddings.npy")
+save_numpy_to_gcs(model.item_emb.embeddings.numpy(), "models/sigr_v1/item_embeddings.npy")
+save_numpy_to_gcs(model.social_influence.numpy(), "models/sigr_v1/social_influence.npy")
+
+mappings = {
+    "user2idx": {str(k): int(v) for k, v in user2idx.items()},
+    "item2idx": {str(k): int(v) for k, v in item2idx.items()},
+    "group2idx": {str(k): int(v) for k, v in group2idx.items()},
+}
+for name, mapping in mappings.items():
+    blob = gcs_bucket.blob(f"models/sigr_v1/{name}.json")
+    blob.upload_from_string(json.dumps(mapping))
+    print(f"  Saved {name}.json — {len(mapping)} entries")
+
+print("Model saved successfully!")
