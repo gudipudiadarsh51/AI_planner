@@ -7,6 +7,8 @@ import pyarrow.parquet as pq
 import pyarrow.fs as pafs
 from collections import defaultdict
 import gc
+import json
+import io
 
 BUCKET           = "yelp-sigr-training"
 DATA_PREFIX      = "sigr-training"
@@ -29,6 +31,7 @@ def load_parquet(blob_prefix, columns=None):
     table = dataset.read(columns=columns)
     return table.to_pandas()
 
+# ── Load data ─────────────────────────────────────────────────────────────
 print("Loading data...")
 interactions = load_parquet("user_business_interactions", columns=[
     "user_id", "business_id", "review_id", "bgem_edge_weight"
@@ -36,16 +39,30 @@ interactions = load_parquet("user_business_interactions", columns=[
 print(f"  interactions: {len(interactions)}")
 
 group_edges = load_parquet("group_item_edges", columns=[
-    "group_id", "item_id", "edge_weight"
+    "group_id", "item_id", "edge_weight", "visit_dt"
 ])
 print(f"  group_edges: {len(group_edges)}")
+
+# Load implicit_groups — this has the ACTUAL group membership
+# (friends who co-visited same business at same time)
+implicit_groups = load_parquet("implicit_groups", columns=[
+    "group_id", "user_id", "business_id"
+])
+print(f"  implicit_groups: {len(implicit_groups)}")
 print("Data loaded.")
 
-all_users = interactions["user_id"].dropna().unique()
+# ── ID Encoding ───────────────────────────────────────────────────────────
+# Include users from both interactions AND implicit_groups
+all_users = pd.concat([
+    interactions["user_id"],
+    implicit_groups["user_id"]
+]).dropna().unique()
+
 all_items = pd.concat([
     interactions["business_id"],
     group_edges["item_id"]
 ]).dropna().unique()
+
 all_groups = group_edges["group_id"].dropna().unique()
 
 user2idx  = {u: i for i, u in enumerate(all_users)}
@@ -58,30 +75,86 @@ N_GROUPS = len(group2idx)
 
 print(f"Users: {N_USERS} | Items: {N_ITEMS} | Groups: {N_GROUPS}")
 
-print("Building group member map...")
-interactions["user_idx"] = interactions["user_id"].map(user2idx)
-interactions["item_idx"] = interactions["business_id"].map(item2idx)
-group_edges["group_idx"] = group_edges["group_id"].map(group2idx)
-group_edges["item_idx"]  = group_edges["item_id"].map(item2idx)
-
-item_to_users = interactions.groupby("item_idx")["user_idx"].apply(list).to_dict()
+# ── Build group member map from implicit_groups (Paper Section VI-B) ──────
+# This is the correct approach: group members are friends who co-visited
+print("Building group member map from implicit_groups...")
+implicit_groups["user_idx"] = implicit_groups["user_id"].map(user2idx)
+implicit_groups["group_idx"] = implicit_groups["group_id"].map(group2idx)
 
 group_member_map = defaultdict(list)
-for gidx, iidx in zip(
-    group_edges.drop_duplicates("group_idx")["group_idx"].dropna().astype(int),
-    group_edges.drop_duplicates("group_idx")["item_idx"].dropna().astype(int)
-):
-    members = item_to_users.get(iidx, [])[:MAX_GROUP_SIZE]
-    group_member_map[gidx] = [int(m) for m in members if pd.notna(m)]
+for gidx, members_df in implicit_groups.dropna(
+    subset=["group_idx", "user_idx"]
+).groupby("group_idx"):
+    member_list = members_df["user_idx"].astype(int).unique().tolist()
+    group_member_map[int(gidx)] = member_list[:MAX_GROUP_SIZE]
 
-print(f"Group member map built: {len(group_member_map)} groups")
+print(f"  Groups with members: {len(group_member_map)}")
+avg_size = np.mean([len(m) for m in group_member_map.values()])
+print(f"  Average group size: {avg_size:.2f}")
 
-uv_member_map = interactions.groupby("user_idx")["item_idx"].apply(list).to_dict()
-print("User-item map built.")
-
-del item_to_users
+# Free implicit_groups memory
+del implicit_groups
 gc.collect()
 
+# ── Build user-item map for negative sampling ─────────────────────────────
+print("Building user-item map...")
+interactions["user_idx"] = interactions["user_id"].map(user2idx)
+interactions["item_idx"] = interactions["business_id"].map(item2idx)
+
+uv_member_map = interactions.dropna(
+    subset=["user_idx", "item_idx"]
+).groupby("user_idx")["item_idx"].apply(
+    lambda x: x.astype(int).tolist()
+).to_dict()
+print("User-item map built.")
+
+# ── Train/test split by timestamp (Paper Section VI-C) ────────────────────
+# "use the 80th percentile as the cut-off point"
+print("Splitting group-item data by timestamp (80/20)...")
+group_edges["group_idx"] = group_edges["group_id"].map(group2idx)
+group_edges["item_idx"] = group_edges["item_id"].map(item2idx)
+
+if "visit_dt" in group_edges.columns:
+    group_edges = group_edges.sort_values("visit_dt")
+    cutoff_idx = int(len(group_edges) * 0.8)
+    train_gv = group_edges.iloc[:cutoff_idx].dropna(subset=["group_idx", "item_idx"])
+    test_gv = group_edges.iloc[cutoff_idx:].dropna(subset=["group_idx", "item_idx"])
+else:
+    # Fallback to random split if no timestamp
+    np.random.seed(42)
+    mask = np.random.rand(len(group_edges)) > 0.8
+    train_gv = group_edges[~mask].dropna(subset=["group_idx", "item_idx"])
+    test_gv = group_edges[mask].dropna(subset=["group_idx", "item_idx"])
+
+print(f"  Train G_GV: {len(train_gv)} | Test G_GV: {len(test_gv)}")
+
+# ── Prepare arrays ────────────────────────────────────────────────────────
+uv_users   = interactions["user_idx"].fillna(0).astype(int).values
+uv_items   = interactions["item_idx"].fillna(0).astype(int).values
+uv_weights = interactions["bgem_edge_weight"].values.astype(np.float32)
+
+# Use only TRAINING group edges for training
+gv_groups  = train_gv["group_idx"].fillna(0).astype(int).values
+gv_items   = train_gv["item_idx"].fillna(0).astype(int).values
+gv_weights = train_gv["edge_weight"].values.astype(np.float32)
+
+# Save test set to GCS for evaluation
+print("Saving test set to GCS...")
+from google.cloud import storage
+gcs_client = storage.Client()
+gcs_bucket = gcs_client.bucket(BUCKET)
+
+test_records = test_gv[["group_idx", "item_idx"]].to_json(orient="records")
+blob = gcs_bucket.blob("models/sigr_v1/test_set.json")
+blob.upload_from_string(test_records)
+print(f"  Saved test set: {len(test_gv)} records")
+
+del interactions, group_edges, train_gv, test_gv
+gc.collect()
+
+print(f"G_UV: {len(uv_users)} | G_GV (train): {len(gv_groups)}")
+
+# ── Padding helper ────────────────────────────────────────────────────────
 def get_member_arrays(group_indices):
     batch_members = []
     batch_masks   = []
@@ -99,6 +172,7 @@ def get_member_arrays(group_indices):
         tf.constant(batch_masks,   dtype=tf.float32)
     )
 
+# ── BGEM Model ────────────────────────────────────────────────────────────
 class BGEMModel(tf.keras.Model):
     def __init__(self, n_users, n_items, n_groups, emb_dim):
         super().__init__()
@@ -137,18 +211,17 @@ class BGEMModel(tf.keras.Model):
         v = self.item_emb(item_ids)
         return tf.reduce_sum(g * v, axis=-1)
 
+# ── Negative Sampling ─────────────────────────────────────────────────────
 item_popularity = (
-    interactions
-    .groupby("business_id")["review_id"]
-    .count()
-    .reset_index()
-    .rename(columns={"review_id": "count"})
+    pd.DataFrame({"item_idx": uv_items})
+    .groupby("item_idx")
+    .size()
+    .reset_index(name="count")
 )
 item_popularity["prob"] = item_popularity["count"] ** 0.75
 item_popularity["prob"] /= item_popularity["prob"].sum()
 
-item_pop_indices = item_popularity["business_id"].map(
-    item2idx).fillna(0).astype(int).values
+item_pop_indices = item_popularity["item_idx"].values
 item_pop_probs   = item_popularity["prob"].values
 
 def sample_negatives_uv(n, k):
@@ -172,6 +245,7 @@ def sample_negatives_gv(group_indices, k):
         batch_negs.append(negs)
     return np.array(batch_negs)
 
+# ── BPR Loss ──────────────────────────────────────────────────────────────
 def bpr_loss(pos_scores, neg_scores, edge_weights):
     pos_loss = tf.math.log_sigmoid(pos_scores)
     neg_loss = tf.reduce_mean(
@@ -179,18 +253,7 @@ def bpr_loss(pos_scores, neg_scores, edge_weights):
     )
     return -tf.reduce_mean(edge_weights * (pos_loss + neg_loss))
 
-uv_users   = interactions["user_idx"].fillna(0).astype(int).values
-uv_items   = interactions["item_idx"].fillna(0).astype(int).values
-uv_weights = interactions["bgem_edge_weight"].values.astype(np.float32)
-
-gv_groups  = group_edges["group_idx"].fillna(0).astype(int).values
-gv_items   = group_edges["item_idx"].fillna(0).astype(int).values
-gv_weights = group_edges["edge_weight"].values.astype(np.float32)
-
-del interactions, group_edges
-gc.collect()
-print(f"G_UV: {len(uv_users)} | G_GV: {len(gv_groups)}")
-
+# ── Model + Optimiser ─────────────────────────────────────────────────────
 model     = BGEMModel(N_USERS, N_ITEMS, N_GROUPS, EMBEDDING_DIM)
 optimizer = tf.keras.optimizers.Adam(LEARNING_RATE)
 
@@ -220,6 +283,7 @@ def train_step_gv(member_ids, member_mask, v_pos_ids, v_neg_ids, weights):
     optimizer.apply_gradients(zip(grads, model.trainable_variables))
     return loss
 
+# ── Joint Training Loop (Algorithm 1) ─────────────────────────────────────
 print("Starting joint training...")
 n_uv = len(uv_users)
 n_gv = len(gv_groups)
@@ -285,17 +349,8 @@ for epoch in range(EPOCHS):
           f"G_UV Loss: {epoch_loss_uv/max(n_uv_batches,1):.4f} | "
           f"G_GV Loss: {epoch_loss_gv/max(n_gv_batches,1):.4f}")
 
-save_path = os.environ.get(
-    "AIP_MODEL_DIR",
-    "gs://yelp-sigr-training/models/sigr_v1"
-)
-
-from google.cloud import storage
-import io
-import json
-
-client = storage.Client()
-gcs_bucket = client.bucket("yelp-sigr-training")
+# ── Save model artifacts ──────────────────────────────────────────────────
+print("Saving model artifacts...")
 
 def save_numpy_to_gcs(array, blob_name):
     buf = io.BytesIO()
@@ -305,11 +360,11 @@ def save_numpy_to_gcs(array, blob_name):
     blob.upload_from_file(buf)
     print(f"  Saved {blob_name} — shape {array.shape}")
 
-print("Saving model artifacts...")
 save_numpy_to_gcs(model.user_emb.embeddings.numpy(), "models/sigr_v1/user_embeddings.npy")
 save_numpy_to_gcs(model.item_emb.embeddings.numpy(), "models/sigr_v1/item_embeddings.npy")
 save_numpy_to_gcs(model.social_influence.numpy(), "models/sigr_v1/social_influence.npy")
 
+# Save ID mappings
 mappings = {
     "user2idx": {str(k): int(v) for k, v in user2idx.items()},
     "item2idx": {str(k): int(v) for k, v in item2idx.items()},
@@ -319,5 +374,11 @@ for name, mapping in mappings.items():
     blob = gcs_bucket.blob(f"models/sigr_v1/{name}.json")
     blob.upload_from_string(json.dumps(mapping))
     print(f"  Saved {name}.json — {len(mapping)} entries")
+
+# Save group member map for evaluation
+gm_serializable = {str(k): v for k, v in group_member_map.items()}
+blob = gcs_bucket.blob("models/sigr_v1/group_member_map.json")
+blob.upload_from_string(json.dumps(gm_serializable))
+print(f"  Saved group_member_map.json — {len(gm_serializable)} groups")
 
 print("Model saved successfully!")
