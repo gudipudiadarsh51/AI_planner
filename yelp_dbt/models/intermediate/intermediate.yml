@@ -1,0 +1,72 @@
+version: 2
+
+models:
+  - name: int_social_edges
+    description: "This model creates a social graph of users based on their friendships."
+    columns:
+      - name: user_id
+        description: "The unique identifier for the user."
+        tests:
+          - not_null
+          - relationships:
+             arguments:
+              to: ref('stg_users')
+              field: user_id
+      
+      - name: friend_id
+        description: "The unique identifier for the user's friend."
+        tests:
+          - not_null
+          - relationships:
+             arguments:
+              to: ref('stg_users')
+              field: user_id
+             config:
+              severity: warn
+  - name: int_review_signals
+    description: "Objective review signals: timing gaps, burst counts, text-duplication counts. No flags or scoring."
+    columns:
+      - name: review_id
+        tests:
+          - not_null
+          - unique
+      - name: user_id
+        tests:
+          - not_null
+      - name: reviews_same_day
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 1  
+                max_value: 200      # a review is at least 1 on its own day
+      - name: same_text_count
+        tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 1
+                max_value: 20 
+
+  - name: int_review_score
+    description: "Review trust flags and score derived from signals. Flags suspicious reviews; does not drop them."
+    columns:
+      - name: review_id
+        tests:
+          - not_null
+          - unique
+      - name: review_trust_score
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 1
+      - name: is_suspicious
+        tests:
+          - not_null
+      - name: flag_rapid_review
+        tests:
+          - not_null
+      - name: flag_repeated_text
+        tests:
+          - not_null
