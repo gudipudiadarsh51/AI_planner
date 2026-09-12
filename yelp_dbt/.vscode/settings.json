@@ -1,0 +1,8 @@
+{
+    "dbt.deferConfigPerProject": {
+        "": {
+            "deferToProduction": true
+        }
+    },
+    "dbt.dbtMajorVersion": "v1"
+}

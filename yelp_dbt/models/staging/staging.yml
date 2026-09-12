@@ -1,0 +1,147 @@
+# models/staging/staging.yml
+version: 2
+
+models:
+  - name: stg_businesses
+    description: "Cleaned business dimension, one row per business_id."
+    columns:
+      - name: business_id
+        description: "Primary key."
+        tests:
+          - not_null
+          - unique
+      - name: name
+        tests:
+          - not_null
+      - name: city
+        tests:
+          - not_null
+      - name: state
+        tests:
+          - not_null
+      - name: stars
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 1
+                max_value: 5
+      - name: review_count
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+      - name: is_open
+        tests:
+          - accepted_values:
+              arguments:
+                values: [0, 1]
+                quote: false
+      - name: latitude
+        tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: -90
+                max_value: 90
+      - name: longitude
+        tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: -180
+                max_value: 180
+  - name: stg_users
+    description: "Cleaned user dimension, one row per user_id."
+    columns:
+      - name: user_id
+        description: "Primary key."
+        tests:
+          - not_null
+          - unique
+      - name: name
+        tests:
+          - not_null
+      - name: review_count
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+      - name: average_stars
+        tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 5
+      - name: yelping_since
+        tests:
+          - not_null
+
+  - name: stg_reviews
+    description: "Cleaned review facts, one row per review_id."
+    columns:
+      - name: review_id
+        description: "Primary key."
+        tests:
+          - not_null
+          - unique
+      - name: user_id
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_users')
+                field: user_id
+              config:
+                severity: warn
+      - name: business_id
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_businesses')
+                field: business_id
+      - name: stars
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 1
+                max_value: 5
+      - name: date
+        tests:
+          - not_null
+
+  - name: stg_tips
+    description: "Cleaned tip facts."
+    columns:
+      - name: user_id
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_users')
+                field: user_id
+      - name: business_id
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_businesses')
+                field: business_id
+      - name: compliment_count
+        tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+
+  - name: stg_checkins
+    description: "Cleaned check-in facts."
+    columns:
+      - name: business_id
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_businesses')
+                field: business_id

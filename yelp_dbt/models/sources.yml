@@ -1,0 +1,8 @@
+sources:
+  - name: yelp
+    tables:
+      - name: raw_businesses
+      - name: raw_checkins
+      - name: raw_reviews
+      - name: raw_users
+      - name: raw_tips
